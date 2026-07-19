@@ -25,6 +25,7 @@ from backend.pdf_report import build_pdf_report
 from backend.docx_report import build_docx_report
 from backend.recommendations import get_courses_for_domain, get_certifications_for_domain
 from backend.responses_store import save_response
+from backend.sheets_client import is_sheets_backend_active
 from utils.validators import validate_profile
 
 from frontend.styles import inject_css
@@ -165,12 +166,17 @@ with st.sidebar:
             "Add WATSONX_API_KEY, WATSONX_PROJECT_ID, WATSONX_URL and "
             "WATSONX_MODEL_ID to your .env to enable live AI generation."
         )
-    sheets_label = (
+status_ok = CONFIG.is_configured
+status_label = "🟢 watsonx.ai configured" if status_ok else "🟡 Offline demo mode"
+st.caption(status_label)
+
+sheets_label = (
     "🟢 Google Sheets connected"
     if is_sheets_backend_active()
     else "🟡 Local CSV fallback"
 )
-    st.caption(sheets_label)
+
+st.caption(sheets_label)
 
     if st.button("🚪 Logout", key="sidebar_logout", use_container_width=True):
         for k in ["auth_user", "profile", "roadmap", "completed_weeks", "completed_courses", "completed_certs"]:
