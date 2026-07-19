@@ -165,7 +165,11 @@ with st.sidebar:
             "Add WATSONX_API_KEY, WATSONX_PROJECT_ID, WATSONX_URL and "
             "WATSONX_MODEL_ID to your .env to enable live AI generation."
         )
-    sheets_label = "🟢 Google Sheets connected" if SHEETS_CONFIG.is_configured else "🟡 Local storage fallback"
+    sheets_label = (
+    "🟢 Google Sheets connected"
+    if is_sheets_backend_active()
+    else "🟡 Local CSV fallback"
+)
     st.caption(sheets_label)
 
     if st.button("🚪 Logout", key="sidebar_logout", use_container_width=True):
