@@ -64,17 +64,15 @@ def skill_gap_bar(gaps: list[dict[str, Any]], dark: bool = True) -> go.Figure:
     fig = go.Figure()
     fig.add_bar(name="Current Level", x=skills, y=current, marker_color=TEAL)
     fig.add_bar(name="Required Level", x=skills, y=required, marker_color=VIOLET, opacity=0.55)
-    fig.update_layout(
-        **_base_layout(dark, "Skill Gap: Current vs. Required"),
-        barmode="group",
-        height=340,
-        yaxis=dict(
-            **_base_layout(dark)["yaxis"],
-            tickmode="array",
-            tickvals=[0, 1, 2, 3],
-            ticktext=["None", "Basic", "Intermediate", "Advanced"],
-        ),
+
+    layout = _base_layout(dark, "Skill Gap: Current vs. Required")
+    layout["yaxis"] = dict(
+        **layout["yaxis"],
+        tickmode="array",
+        tickvals=[0, 1, 2, 3],
+        ticktext=["None", "Basic", "Intermediate", "Advanced"],
     )
+    fig.update_layout(**layout, barmode="group", height=340)
     return fig
 
 
