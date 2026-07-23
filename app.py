@@ -522,10 +522,10 @@ PAGES = {
     "Courses & Certs": render_courses_page,
     "Progress Tracker": render_progress_page,
     "Dashboard": render_dashboard_page,
-    "📚 Free Courses": render_free_courses_page,
-    "📄 Resume Builder": render_resume_builder_page,
-    "📊 Resume Review": render_resume_review_page,
-    "💼 Job Search": render_job_search_page,
+    "Free Courses": render_free_courses_page,
+    "Resume Builder": render_resume_builder_page,
+    "Resume Review": render_resume_review_page,
+    "Job Search": render_job_search_page,
 }
 
 try:
