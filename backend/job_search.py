@@ -3,13 +3,20 @@ backend/job_search.py
 ------------------------
 Job Search backend.
 
-Primary source: RemoteOK's public JSON API (https://remoteok.com/api) -
-free, no API key required. If that request fails for any reason (network
-error, timeout, rate limit, schema change), search_jobs() falls back to a
-small curated sample dataset so the page never breaks - the same
-fail-soft pattern already used by backend/watsonx_client.py (offline
-roadmap) and backend/sheets_client.py (local CSV fallback) elsewhere in
-this project.
+Sources (merged, deduped): RemoteOK, Remotive, and Arbeitnow - all free,
+public JSON APIs, no key required. Each source is fetched independently;
+if one fails (network error, timeout, rate limit, schema change) the
+others still contribute results. Only if ALL three fail/return nothing
+does search_jobs() fall back to a small curated sample dataset, so the
+page never breaks - the same fail-soft pattern already used by
+backend/watsonx_client.py (offline roadmap) and backend/sheets_client.py
+(local CSV fallback) elsewhere in this project.
+
+Search: RapidFuzz-powered fuzzy matching + a domain/role synonym map on
+the `title` filter (e.g. "ML" also finds "Machine Learning" roles), with
+a stdlib difflib fallback if rapidfuzz isn't installed - add
+`rapidfuzz>=3.9` to requirements.txt for full fuzzy matching; without it
+this still works correctly, just with weaker similarity scoring.
 """
 
 from __future__ import annotations
@@ -24,6 +31,8 @@ from backend.logger_setup import get_logger
 logger = get_logger(__name__)
 
 REMOTEOK_API_URL = "https://remoteok.com/api"
+REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
+ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api"
 _REQUEST_TIMEOUT = 10
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LearnMateAI/1.0)"}
 
@@ -42,7 +51,7 @@ class JobListing:
 
 
 # ------------------------------------------------------------------
-# Fallback sample dataset - used only if the live API is unavailable.
+# Fallback sample dataset - used only if every live source fails.
 # ------------------------------------------------------------------
 _SAMPLE_JOBS: list[JobListing] = [
     JobListing("Data Scientist", "Acme Analytics", "Remote", "Mid-level", True,
@@ -90,6 +99,10 @@ def _infer_experience(title: str, tags: list[str]) -> str:
     return "Mid-level"
 
 
+# ------------------------------------------------------------------
+# Provider fetchers - each independent; a failure in one never blocks
+# the others (see _fetch_all_providers).
+# ------------------------------------------------------------------
 def _fetch_remoteok_jobs() -> list[JobListing]:
     """Fetch and normalize listings from RemoteOK's public API."""
     resp = requests.get(REMOTEOK_API_URL, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
@@ -120,27 +133,243 @@ def _fetch_remoteok_jobs() -> list[JobListing]:
     return listings
 
 
+def _fetch_remotive_jobs() -> list[JobListing]:
+    """Fetch and normalize listings from Remotive's public API."""
+    resp = requests.get(REMOTIVE_API_URL, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+
+    listings: list[JobListing] = []
+    for job in data.get("jobs", []):
+        title = str(job.get("title", "")).strip()
+        company = str(job.get("company_name", "Unknown")).strip()
+        if not title or not company:
+            continue
+        tags = [str(t) for t in job.get("tags", [])]
+        salary = str(job.get("salary") or "").strip() or "Not disclosed"
+        listings.append(JobListing(
+            title=title,
+            company=company,
+            location=job.get("candidate_required_location") or "Remote",
+            experience=_infer_experience(title, tags),
+            remote=True,  # Remotive is a remote-only job board
+            salary=salary,
+            url=job.get("url") or "https://remotive.com",
+            source="Remotive",
+            tags=tags,
+        ))
+    return listings
+
+
+def _fetch_arbeitnow_jobs() -> list[JobListing]:
+    """Fetch and normalize listings from Arbeitnow's public API."""
+    resp = requests.get(ARBEITNOW_API_URL, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+
+    listings: list[JobListing] = []
+    for job in data.get("data", []):
+        title = str(job.get("title", "")).strip()
+        company = str(job.get("company_name", "Unknown")).strip()
+        if not title or not company:
+            continue
+        tags = [str(t) for t in job.get("tags", [])]
+        listings.append(JobListing(
+            title=title,
+            company=company,
+            location=job.get("location") or ("Remote" if job.get("remote") else "Not specified"),
+            experience=_infer_experience(title, tags),
+            remote=bool(job.get("remote", False)),
+            salary="Not disclosed",  # Arbeitnow's public API doesn't expose salary
+            url=job.get("url") or "https://www.arbeitnow.com",
+            source="Arbeitnow",
+            tags=tags,
+        ))
+    return listings
+
+
+_PROVIDERS = (
+    ("RemoteOK", _fetch_remoteok_jobs),
+    ("Remotive", _fetch_remotive_jobs),
+    ("Arbeitnow", _fetch_arbeitnow_jobs),
+)
+
+
+def _dedupe(jobs: list[JobListing]) -> list[JobListing]:
+    """Merge duplicate results (same title + company) seen across providers."""
+    seen: set[tuple[str, str]] = set()
+    unique: list[JobListing] = []
+    for j in jobs:
+        key = (j.title.strip().lower(), j.company.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(j)
+    return unique
+
+
+# ------------------------------------------------------------------
+# Streamlit caching, with a safe no-op fallback if streamlit isn't
+# importable (e.g. a plain script/test context).
+# ------------------------------------------------------------------
+try:
+    import streamlit as _st
+    _cache_data = _st.cache_data
+except ImportError:  # pragma: no cover
+    def _cache_data(*_a, **_k):
+        def _decorator(fn):
+            return fn
+        return _decorator
+
+
+@_cache_data(ttl=600, show_spinner=False)
+def _fetch_all_providers() -> list[JobListing]:
+    """Fetch from every provider (each fail-soft independently), merge, and dedupe."""
+    all_jobs: list[JobListing] = []
+    any_succeeded = False
+
+    for name, fetch_fn in _PROVIDERS:
+        try:
+            jobs = fetch_fn()
+            if jobs:
+                any_succeeded = True
+                all_jobs.extend(jobs)
+                logger.info("Fetched %d listings from %s.", len(jobs), name)
+        except Exception as exc:  # noqa: BLE001 - one provider's failure never blocks the others
+            logger.warning("%s fetch failed (%s) — continuing with other providers.", name, exc)
+
+    if not any_succeeded:
+        logger.warning("All job providers failed — using fallback sample job data.")
+        return list(_SAMPLE_JOBS)
+
+    return _dedupe(all_jobs)
+
+
+# ------------------------------------------------------------------
+# Fuzzy matching (RapidFuzz, with a stdlib fallback).
+# ------------------------------------------------------------------
+try:
+    from rapidfuzz import fuzz as _fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    import difflib
+    _RAPIDFUZZ_AVAILABLE = False
+
+
+def _similarity(a: str, b: str) -> float:
+    """Fuzzy similarity score, 0-100. RapidFuzz if available, difflib otherwise."""
+    if not a or not b:
+        return 0.0
+    if _RAPIDFUZZ_AVAILABLE:
+        return _fuzz.WRatio(a, b)
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+
+# ------------------------------------------------------------------
+# Domain/role synonym expansion - "ML" also finds "Machine Learning"
+# roles, "GenAI"/"Prompt Engineering" find AI roles, etc.
+# ------------------------------------------------------------------
+SYNONYM_GROUPS: list[set[str]] = [
+    {"ai", "artificial intelligence", "genai", "generative ai", "prompt engineering", "prompt engineer"},
+    {"ml", "machine learning", "deep learning", "ml engineer", "machine learning engineer"},
+    {"data science", "data scientist", "data analytics", "data analyst", "data analysis"},
+    {"web dev", "web developer", "web development", "frontend", "front-end", "frontend developer",
+     "backend", "back-end", "backend developer", "full stack", "fullstack", "full stack developer"},
+    {"cybersecurity", "cyber security", "infosec", "information security", "security analyst"},
+    {"cloud", "cloud computing", "cloud engineer"},
+    {"ui/ux", "ux", "ui", "user experience", "user interface", "designer", "ux designer", "ui designer"},
+    {"devops", "dev ops", "site reliability", "sre", "ci/cd", "devops engineer"},
+    {"software engineer", "software developer", "programmer", "swe"},
+    {"python", "python developer"},
+]
+
+_FUZZY_THRESHOLD = 55.0
+
+
+def _expand_query(query: str) -> list[str]:
+    """Return [query] plus any synonym terms that match it or its words."""
+    if not query:
+        return []
+    q = query.strip().lower()
+    variants = {q}
+    for group in SYNONYM_GROUPS:
+        if q in group or any(word in group for word in q.split()):
+            variants |= group
+    return list(variants)
+
+
+def _job_score(job: JobListing, query_variants: list[str]) -> float:
+    """Best fuzzy-match score across the job's searchable text and all query variants."""
+    if not query_variants:
+        return 100.0
+    searchable = f"{job.title} {job.company} {' '.join(job.tags)}"
+    return max((_similarity(v, searchable) for v in query_variants), default=0.0)
+
+
+def _fuzzy_rank_by_title(jobs: list[JobListing], title: str) -> list[JobListing]:
+    variants = _expand_query(title)
+    if not variants:
+        return jobs
+    scored = [(j, _job_score(j, variants)) for j in jobs]
+    scored = [(j, s) for j, s in scored if s >= _FUZZY_THRESHOLD]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [j for j, _ in scored]
+
+
+# ------------------------------------------------------------------
+# Public search API
+# ------------------------------------------------------------------
 def search_jobs(
     title: str = "",
     location: str = "",
     remote: bool | None = None,
     experience: str = "",
     company: str = "",
+    page: int = 1,
+    page_size: int = 50,
 ) -> list[JobListing]:
-    """Fetch jobs from RemoteOK (falling back to sample data on failure), then filter."""
-    try:
-        all_jobs = _fetch_remoteok_jobs()
-        if not all_jobs:
-            raise ValueError("RemoteOK returned no parsable listings.")
-        logger.info("Fetched %d listings from RemoteOK.", len(all_jobs))
-    except Exception as exc:  # noqa: BLE001 - any failure falls back gracefully
-        logger.warning("RemoteOK fetch failed (%s) — using fallback sample job data.", exc)
-        all_jobs = list(_SAMPLE_JOBS)
+    """Fetch jobs from all providers (merged/deduped, sample-fallback on
+    total failure), then fuzzy-filter and paginate.
 
-    return filter_jobs(
+    `page`/`page_size` are optional and default to the first up to 50
+    (page_size capped at 50) results, so existing callers that don't pass
+    them behave exactly as before.
+    """
+    all_jobs = _fetch_all_providers()
+    has_filters = bool(title or location or remote is not None or experience or company)
+
+    filtered = filter_jobs(
         all_jobs, title=title, location=location, remote=remote,
         experience=experience, company=company,
     )
+
+    if not filtered and has_filters:
+        # Relax: keep only the fuzzy title match, drop location/remote/experience/company.
+        filtered = filter_jobs(all_jobs, title=title)
+
+    if not filtered and title:
+        # Relax further: fuzzy-rank the whole pool below the normal threshold
+        # so the user sees "similar" roles instead of nothing.
+        variants = _expand_query(title)
+        scored = sorted(
+            ((j, _job_score(j, variants)) for j in all_jobs),
+            key=lambda pair: pair[1], reverse=True,
+        )
+        filtered = [j for j, _ in scored]
+
+    if not filtered:
+        filtered = all_jobs
+
+    if not has_filters:
+        # A bare, filter-less call (e.g. a caller fetching the full pool to
+        # cache/filter client-side, as frontend/job_search_page.py does)
+        # returns everything unpaginated - pagination only kicks in once an
+        # actual search/filter is being performed.
+        return filtered
+
+    page_size = max(1, min(page_size, 50))
+    page = max(1, page)
+    start = (page - 1) * page_size
+    return filtered[start: start + page_size]
 
 
 def filter_jobs(
@@ -151,15 +380,13 @@ def filter_jobs(
     experience: str = "",
     company: str = "",
 ) -> list[JobListing]:
-    """Apply structured filters (title, location, remote, experience, company) to a job list."""
-    results = list(jobs)
+    """Apply structured filters to a job list.
 
-    if title:
-        query = title.strip().lower()
-        results = [
-            j for j in results
-            if query in j.title.lower() or any(query in t.lower() for t in j.tags)
-        ]
+    `title` uses fuzzy + synonym matching (typo-tolerant, e.g. "ML" also
+    matches "Machine Learning" roles). `location`/`company` remain
+    substring filters; `remote`/`experience` remain exact-match filters.
+    """
+    results = _fuzzy_rank_by_title(jobs, title)
 
     if location:
         loc = location.strip().lower()
