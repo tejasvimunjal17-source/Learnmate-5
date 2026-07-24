@@ -1,14 +1,31 @@
 """
 frontend/resume_builder.py
 -----------------------------
-Renders the "Resume Builder" page: a full ATS resume intake form with
-support for multiple projects / certificates / internships, saving via
-backend.resume_store, and generating a downloadable ATS-friendly PDF/DOCX
-via backend.resume_generator - styled entirely with the existing
-frontend/components.py building blocks (no new CSS).
+Renders the "Resume Builder" page.
+
+Education, Projects, Certificates, and Internships are all dynamic
+add/remove card sections. Backend is untouched: Projects/Certificates/
+Internships already map 1:1 onto backend.resume_store's ProjectEntry/
+CertificateEntry/InternshipEntry dataclasses. Education has no dedicated
+dataclass in the backend (ResumeProfile.education is a single str field),
+so the structured education cards captured here (College/University vs
+School entries, each with their own fields) are formatted into a single
+well-structured multi-line string before being assigned to
+ResumeProfile.education - no backend/config changes required.
+
+Note on rendering: backend.resume_generator renders `profile.education`
+by splitting on newlines and prefixing each non-empty line with "- " as
+a bullet (it wasn't modified here per the "backend untouched" requirement).
+So the generated PDF/DOCX will show each education line as its own
+bullet rather than the exact visually-grouped block shown in the sample
+output - the *content and order* match the sample format, but not its
+custom multi-column alignment, since that would require a
+resume_generator.py change.
 """
 
 from __future__ import annotations
+
+import uuid
 
 import streamlit as st
 
@@ -18,41 +35,254 @@ from backend.resume_store import (
 from backend.resume_generator import build_resume_pdf, build_resume_docx
 from frontend.components import hero, glass_card_open, glass_card_close
 
-_DYNAMIC_KEYS = {
-    "resume_projects": "project",
-    "resume_certificates": "certificate",
-    "resume_internships": "internship",
+COLLEGE_LEVEL = "College / University"
+SCHOOL_LEVEL = "School (10th / 12th)"
+SCHOOL_QUALIFICATIONS = ["Secondary Education", "Senior Secondary Education"]
+
+_LIST_STATE_KEYS = ["resume_education", "resume_projects", "resume_certificates", "resume_internships"]
+
+
+# ------------------------------------------------------------------
+# Session state helpers
+# ------------------------------------------------------------------
+def _new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _empty_education() -> dict:
+    return {
+        "_id": _new_id(), "level": COLLEGE_LEVEL,
+        # College / University fields
+        "degree": "", "field_major": "", "institution": "", "university_board": "",
+        "start_year": "", "end_year": "", "present": False,
+        # School fields
+        "qualification": SCHOOL_QUALIFICATIONS[1], "school_name": "", "board": "",
+        "passing_year": "",
+        # Shared fields
+        "city": "", "state": "", "country": "", "grade": "",
+    }
+
+
+def _empty_project() -> dict:
+    return {"_id": _new_id(), "title": "", "tech_stack": "", "description": ""}
+
+
+def _empty_certificate() -> dict:
+    return {"_id": _new_id(), "name": "", "issuer": "", "year": ""}
+
+
+def _empty_internship() -> dict:
+    return {"_id": _new_id(), "role": "", "company": "", "duration": "", "description": ""}
+
+
+_EMPTY_FACTORIES = {
+    "resume_education": _empty_education,
+    "resume_projects": _empty_project,
+    "resume_certificates": _empty_certificate,
+    "resume_internships": _empty_internship,
 }
 
 
 def _init_state() -> None:
-    for key in _DYNAMIC_KEYS:
-        st.session_state.setdefault(key, [{}])
+    for key in _LIST_STATE_KEYS:
+        if key not in st.session_state or not st.session_state[key]:
+            st.session_state[key] = [_EMPTY_FACTORIES[key]()]
     st.session_state.setdefault("resume_profile", None)
 
 
-def _dynamic_section(title: str, state_key: str, fields: list[tuple[str, str]]) -> list[dict]:
-    """Render an 'Add another' repeating group of text inputs; return collected values."""
-    st.markdown(f"**{title}**")
+def _remove_entry(state_key: str, entry_id: str) -> None:
     entries = st.session_state[state_key]
-    collected = []
-    for i, entry in enumerate(entries):
+    if len(entries) <= 1:
+        return  # never delete the last remaining card
+    st.session_state[state_key] = [e for e in entries if e["_id"] != entry_id]
+    st.rerun()
+
+
+def _add_entry(state_key: str) -> None:
+    st.session_state[state_key].append(_EMPTY_FACTORIES[state_key]())
+    st.rerun()
+
+
+def _card_header(label: str, state_key: str, entry_id: str, can_remove: bool) -> None:
+    head_col, remove_col = st.columns([6, 1])
+    head_col.markdown(f"**{label}**")
+    with remove_col:
+        if st.button("❌", key=f"remove_{state_key}_{entry_id}",
+                      disabled=not can_remove, help="Remove this entry"):
+            _remove_entry(state_key, entry_id)
+
+
+# ------------------------------------------------------------------
+# Education cards
+# ------------------------------------------------------------------
+def _render_education_entries() -> list[dict]:
+    entries = st.session_state["resume_education"]
+    can_remove = len(entries) > 1
+
+    for idx, entry in enumerate(entries):
+        eid = entry["_id"]
         with st.container(border=True):
-            values = {}
-            cols = st.columns(len(fields))
-            for (field_key, label), col in zip(fields, cols):
-                values[field_key] = col.text_input(
-                    label, value=entry.get(field_key, ""),
-                    key=f"{state_key}_{field_key}_{i}",
+            _card_header(f"Education Entry {idx + 1}", "resume_education", eid, can_remove)
+
+            entry["level"] = st.selectbox(
+                "Education Level", [COLLEGE_LEVEL, SCHOOL_LEVEL],
+                index=[COLLEGE_LEVEL, SCHOOL_LEVEL].index(entry["level"]),
+                key=f"edu_level_{eid}",
+            )
+
+            if entry["level"] == COLLEGE_LEVEL:
+                c1, c2 = st.columns(2)
+                entry["degree"] = c1.text_input(
+                    "Degree (e.g. Bachelor of Commerce (Hons))",
+                    value=entry["degree"], key=f"edu_degree_{eid}",
                 )
-            collected.append(values)
-    if st.button(f"➕ Add another {_DYNAMIC_KEYS[state_key]}", key=f"add_{state_key}"):
-        st.session_state[state_key].append({})
-        st.rerun()
-    st.session_state[state_key] = collected
-    return collected
+                entry["field_major"] = c2.text_input(
+                    "Field / Major", value=entry["field_major"], key=f"edu_field_{eid}",
+                )
+                c3, c4 = st.columns(2)
+                entry["institution"] = c3.text_input(
+                    "College / University Name", value=entry["institution"], key=f"edu_inst_{eid}",
+                )
+                entry["university_board"] = c4.text_input(
+                    "University / Board", value=entry["university_board"], key=f"edu_univ_{eid}",
+                )
+                c5, c6, c7 = st.columns([1, 1, 1])
+                entry["start_year"] = c5.text_input(
+                    "Start Year", value=entry["start_year"], key=f"edu_start_{eid}",
+                )
+                entry["present"] = c6.checkbox(
+                    "Present", value=entry["present"], key=f"edu_present_{eid}",
+                )
+                entry["end_year"] = c7.text_input(
+                    "End Year", value=entry["end_year"], key=f"edu_end_{eid}",
+                    disabled=entry["present"],
+                )
+                c8, c9, c10 = st.columns(3)
+                entry["city"] = c8.text_input("City", value=entry["city"], key=f"edu_city_{eid}")
+                entry["state"] = c9.text_input("State", value=entry["state"], key=f"edu_state_{eid}")
+                entry["country"] = c10.text_input("Country", value=entry["country"], key=f"edu_country_{eid}")
+                entry["grade"] = st.text_input(
+                    "CGPA / Percentage (optional)", value=entry["grade"], key=f"edu_grade_{eid}",
+                )
+            else:
+                entry["qualification"] = st.selectbox(
+                    "Qualification", SCHOOL_QUALIFICATIONS,
+                    index=SCHOOL_QUALIFICATIONS.index(entry["qualification"])
+                    if entry["qualification"] in SCHOOL_QUALIFICATIONS else 1,
+                    key=f"edu_qual_{eid}",
+                )
+                c1, c2 = st.columns(2)
+                entry["school_name"] = c1.text_input(
+                    "School Name", value=entry["school_name"], key=f"edu_school_{eid}",
+                )
+                entry["board"] = c2.text_input(
+                    "Education Board (CBSE / ICSE / State Board / IB / etc.)",
+                    value=entry["board"], key=f"edu_board_{eid}",
+                )
+                entry["passing_year"] = st.text_input(
+                    "Passing Year", value=entry["passing_year"], key=f"edu_passing_{eid}",
+                )
+                c3, c4, c5 = st.columns(3)
+                entry["city"] = c3.text_input("City", value=entry["city"], key=f"edu_scity_{eid}")
+                entry["state"] = c4.text_input("State", value=entry["state"], key=f"edu_sstate_{eid}")
+                entry["country"] = c5.text_input("Country", value=entry["country"], key=f"edu_scountry_{eid}")
+                entry["grade"] = st.text_input(
+                    "Percentage / CGPA (optional)", value=entry["grade"], key=f"edu_sgrade_{eid}",
+                )
+
+    if st.button("➕ Add Education", key="add_resume_education"):
+        _add_entry("resume_education")
+
+    return entries
 
 
+def _format_education_entry(e: dict) -> str:
+    location = ", ".join(p for p in [e.get("city", ""), e.get("state", ""), e.get("country", "")] if p)
+
+    if e["level"] == COLLEGE_LEVEL:
+        title_line = e["degree"] or e["field_major"]
+        status = "Pursuing" if e["present"] else (e["end_year"] or "")
+        if title_line and status:
+            title_line = f"{title_line} | {status}"
+        years = f"{e['start_year']} – {'Present' if e['present'] else e['end_year']}".strip(" –")
+        last_line = f"{years}          {location}".strip() if (years or location) else ""
+        lines = [title_line, e["institution"], e["university_board"], last_line]
+    else:
+        years = e["passing_year"]
+        last_line = f"{years}          {location}".strip() if (years or location) else ""
+        lines = [e["qualification"], e["school_name"], e["board"], last_line]
+
+    lines = [l for l in lines if l and l.strip()]
+    if e.get("grade"):
+        lines.append(f"Grade: {e['grade']}")
+    return "\n".join(lines)
+
+
+def _education_entries_to_text(entries: list[dict]) -> str:
+    blocks = [_format_education_entry(e) for e in entries]
+    blocks = [b for b in blocks if b.strip()]
+    return "\n".join(blocks)
+
+
+# ------------------------------------------------------------------
+# Projects / Certificates / Internships cards
+# ------------------------------------------------------------------
+def _render_project_entries() -> list[dict]:
+    entries = st.session_state["resume_projects"]
+    can_remove = len(entries) > 1
+    for idx, entry in enumerate(entries):
+        eid = entry["_id"]
+        with st.container(border=True):
+            _card_header(f"Project {idx + 1}", "resume_projects", eid, can_remove)
+            c1, c2 = st.columns(2)
+            entry["title"] = c1.text_input("Project Title", value=entry["title"], key=f"proj_title_{eid}")
+            entry["tech_stack"] = c2.text_input("Tech Stack", value=entry["tech_stack"], key=f"proj_tech_{eid}")
+            entry["description"] = st.text_area(
+                "Description", value=entry["description"], key=f"proj_desc_{eid}", height=70,
+            )
+    if st.button("➕ Add Another Project", key="add_resume_projects"):
+        _add_entry("resume_projects")
+    return entries
+
+
+def _render_certificate_entries() -> list[dict]:
+    entries = st.session_state["resume_certificates"]
+    can_remove = len(entries) > 1
+    for idx, entry in enumerate(entries):
+        eid = entry["_id"]
+        with st.container(border=True):
+            _card_header(f"Certificate {idx + 1}", "resume_certificates", eid, can_remove)
+            c1, c2, c3 = st.columns(3)
+            entry["name"] = c1.text_input("Certificate Name", value=entry["name"], key=f"cert_name_{eid}")
+            entry["issuer"] = c2.text_input("Issuer", value=entry["issuer"], key=f"cert_issuer_{eid}")
+            entry["year"] = c3.text_input("Year", value=entry["year"], key=f"cert_year_{eid}")
+    if st.button("➕ Add Another Certificate", key="add_resume_certificates"):
+        _add_entry("resume_certificates")
+    return entries
+
+
+def _render_internship_entries() -> list[dict]:
+    entries = st.session_state["resume_internships"]
+    can_remove = len(entries) > 1
+    for idx, entry in enumerate(entries):
+        eid = entry["_id"]
+        with st.container(border=True):
+            _card_header(f"Internship {idx + 1}", "resume_internships", eid, can_remove)
+            c1, c2, c3 = st.columns(3)
+            entry["role"] = c1.text_input("Role", value=entry["role"], key=f"intern_role_{eid}")
+            entry["company"] = c2.text_input("Company", value=entry["company"], key=f"intern_company_{eid}")
+            entry["duration"] = c3.text_input("Duration", value=entry["duration"], key=f"intern_duration_{eid}")
+            entry["description"] = st.text_area(
+                "Description", value=entry["description"], key=f"intern_desc_{eid}", height=70,
+            )
+    if st.button("➕ Add Another Internship", key="add_resume_internships"):
+        _add_entry("resume_internships")
+    return entries
+
+
+# ------------------------------------------------------------------
+# Page
+# ------------------------------------------------------------------
 def render_resume_builder_page():
     _init_state()
     user = st.session_state.get("auth_user") or {}
@@ -67,28 +297,11 @@ def render_resume_builder_page():
     c1, c2 = st.columns(2)
     first_name = c1.text_input("First Name *", value=user.get("first_name", ""))
     last_name = c2.text_input("Last Name *", value=user.get("last_name", ""))
-    c3, c4 = st.columns(2)
-    email = c3.text_input("Email *", value=user.get("email", ""))
-    phone = c4.text_input("Phone *")
-    address = st.text_input("Address")
-    c5, c6, c7 = st.columns(3)
-    linkedin = c5.text_input("LinkedIn URL")
-    github = c6.text_input("GitHub URL")
-    portfolio = c7.text_input("Portfolio URL")
-    glass_card_close()
-
-    glass_card_open("🎯 Career Objective")
-    career_objective = st.text_area(
-        "Career Objective", height=90,
-        placeholder="2-3 sentences summarizing your goals and value proposition.",
-    )
+    email = st.text_input("Email *", value=user.get("email", ""))
     glass_card_close()
 
     glass_card_open("🎓 Education")
-    education = st.text_area(
-        "Education (one entry per line)", height=90,
-        placeholder="B.Tech in Computer Science, XYZ University, 2024, GPA 8.5/10",
-    )
+    education_entries = _render_education_entries()
     glass_card_close()
 
     glass_card_open("🧠 Skills")
@@ -97,72 +310,46 @@ def render_resume_builder_page():
     glass_card_close()
 
     glass_card_open("💼 Internships")
-    internship_entries = _dynamic_section(
-        "Internship Entries", "resume_internships",
-        [("role", "Role"), ("company", "Company"), ("duration", "Duration")],
-    )
-    internship_descriptions = []
-    for i, entry in enumerate(internship_entries):
-        desc = st.text_area(f"Description - Internship {i + 1}", key=f"internship_desc_{i}", height=60)
-        internship_descriptions.append(desc)
+    internship_entries = _render_internship_entries()
     glass_card_close()
 
     glass_card_open("🛠️ Projects")
-    project_entries = _dynamic_section(
-        "Project Entries", "resume_projects",
-        [("title", "Project Title"), ("tech_stack", "Tech Stack")],
-    )
-    project_descriptions = []
-    for i, entry in enumerate(project_entries):
-        desc = st.text_area(f"Description - Project {i + 1}", key=f"project_desc_{i}", height=60)
-        project_descriptions.append(desc)
+    project_entries = _render_project_entries()
     glass_card_close()
 
     glass_card_open("🏅 Certificates")
-    certificate_entries = _dynamic_section(
-        "Certificate Entries", "resume_certificates",
-        [("name", "Certificate Name"), ("issuer", "Issuer"), ("year", "Year")],
-    )
+    certificate_entries = _render_certificate_entries()
     glass_card_close()
 
     glass_card_open("🏆 Achievements")
     achievements = st.text_area("Achievements (one per line)", height=80)
     glass_card_close()
 
-    glass_card_open("🌐 Languages & Hobbies")
-    c8, c9 = st.columns(2)
-    languages_raw = c8.text_input("Languages (comma-separated)")
-    hobbies_raw = c9.text_input("Hobbies (comma-separated)")
-    glass_card_close()
-
-    glass_card_open("📇 References (optional)")
-    references = st.text_area("References", height=70,
-                               placeholder="Available upon request, or list name/relation/contact.")
+    glass_card_open("🌐 Hobbies")
+    hobbies_raw = st.text_input("Hobbies (comma-separated)")
     glass_card_close()
 
     def _build_profile() -> ResumeProfile:
         return ResumeProfile(
-            first_name=first_name.strip(), last_name=last_name.strip(),
-            email=email.strip(), phone=phone.strip(), address=address.strip(),
-            linkedin=linkedin.strip(), github=github.strip(), portfolio=portfolio.strip(),
-            career_objective=career_objective.strip(), education=education.strip(),
+            first_name=first_name.strip(),
+            last_name=last_name.strip(),
+            email=email.strip(),
+            education=_education_entries_to_text(education_entries),
             skills=[s.strip() for s in skills_raw.split(",") if s.strip()],
             achievements=achievements.strip(),
-            languages=[s.strip() for s in languages_raw.split(",") if s.strip()],
             hobbies=[s.strip() for s in hobbies_raw.split(",") if s.strip()],
-            references=references.strip(),
             projects=[
-                ProjectEntry(title=e.get("title", ""), tech_stack=e.get("tech_stack", ""), description=d)
-                for e, d in zip(project_entries, project_descriptions) if e.get("title")
+                ProjectEntry(title=e["title"], tech_stack=e["tech_stack"], description=e["description"])
+                for e in project_entries if e["title"].strip()
             ],
             certificates=[
-                CertificateEntry(name=e.get("name", ""), issuer=e.get("issuer", ""), year=e.get("year", ""))
-                for e in certificate_entries if e.get("name")
+                CertificateEntry(name=e["name"], issuer=e["issuer"], year=e["year"])
+                for e in certificate_entries if e["name"].strip()
             ],
             internships=[
-                InternshipEntry(role=e.get("role", ""), company=e.get("company", ""),
-                                 duration=e.get("duration", ""), description=d)
-                for e, d in zip(internship_entries, internship_descriptions) if e.get("role")
+                InternshipEntry(role=e["role"], company=e["company"],
+                                 duration=e["duration"], description=e["description"])
+                for e in internship_entries if e["role"].strip()
             ],
         )
 
@@ -175,8 +362,8 @@ def render_resume_builder_page():
             try:
                 save_resume(_build_profile())
                 st.success("✅ Resume details saved.")
-            except Exception:
-                st.error("Couldn't save your resume details right now. Please try again.")
+            except Exception as exc:
+                st.error(f"Couldn't save your resume details right now: {exc}")
 
     if b2.button("✨ Generate Resume", use_container_width=True):
         if not (first_name and last_name and email):
@@ -196,8 +383,8 @@ def render_resume_builder_page():
                     file_name=f"{profile.full_name.replace(' ', '_') or 'resume'}.pdf",
                     mime="application/pdf", use_container_width=True,
                 )
-            except Exception:
-                st.error("Couldn't generate the PDF right now.")
+            except Exception as exc:
+                st.error(f"Couldn't generate the PDF right now: {exc}")
         else:
             st.button("⬇️ Download PDF", disabled=True, use_container_width=True)
 
@@ -211,17 +398,18 @@ def render_resume_builder_page():
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True,
                 )
-            except Exception:
-                st.error("Couldn't generate the Word document right now.")
+            except Exception as exc:
+                st.error(f"Couldn't generate the Word document right now: {exc}")
         else:
             st.button("⬇️ Download DOCX", disabled=True, use_container_width=True)
 
     if profile is not None:
         st.markdown("### 👁️ Preview")
         glass_card_open(profile.full_name or "Your Name")
-        st.caption(" | ".join(p for p in [profile.phone, profile.email, profile.address] if p))
-        if profile.career_objective:
-            st.markdown(f"**Career Objective**  \n{profile.career_objective}")
+        st.caption(profile.email)
+        if profile.education:
+            st.markdown("**Education**")
+            st.text(profile.education)
         if profile.skills:
             st.markdown(f"**Skills**  \n{', '.join(profile.skills)}")
         glass_card_close()
