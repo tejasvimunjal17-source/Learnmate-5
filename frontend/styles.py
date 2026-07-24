@@ -93,10 +93,6 @@ def inject_css(dark_mode: bool = True) -> None:
             color: var(--text);
         }}
 
-        #MainMenu, footer, header[data-testid="stHeader"] {{
-            background: transparent;
-        }}
-
         /* ---------- Typography ---------- */
         h1, h2, h3, .pathway-display {{
             font-family: 'Space Grotesk', sans-serif !important;
@@ -414,17 +410,35 @@ def inject_css(dark_mode: bool = True) -> None:
         }}
 
         /* ================= White-label: hide Streamlit chrome ================= */
-        /* Hide the top decoration bar and hamburger menu */
-        #MainMenu {{ visibility: hidden; }}
-        header {{ visibility: hidden; }}
-        footer {{ visibility: hidden; }}
-        div[data-testid="stHeader"] {{ display: none !important; }}
-        div[data-testid="stToolbar"] {{ display: none !important; }}
-        div[data-testid="stDecoration"] {{ display: none !important; }}
-        div[data-testid="stStatusWidget"] {{ display: none !important; }}
+        /* Ensure the main header container is transparent and non-intrusive */
+        header, div[data-testid="stHeader"] {{
+            background: transparent !important;
+            z-index: 9999 !important;
+        }}
 
-        /* Hide the Fork/GitHub link if applicable */
-        #GithubIcon {{ visibility: hidden; }}
+        /* FORCE SIDEBAR TOGGLE / EXPAND BUTTON TO REMAIN VISIBLE AT ALL TIMES */
+        [data-testid="stSidebarCollapseButton"],
+        [data-testid="stHeaderNav"],
+        button[aria-label="Expand sidebar"],
+        button[aria-label="Collapse sidebar"] {{
+            display: flex !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            z-index: 10000 !important;
+        }}
+
+        /* Hide Streamlit branding elements without hiding the sidebar controls */
+        #MainMenu,
+        footer,
+        #GithubIcon,
+        .stAppDeployButton,
+        div[data-testid="stToolbar"],
+        div[data-testid="stDecoration"],
+        div[data-testid="stStatusWidget"],
+        div[data-testid="stHeaderActionElements"] {{
+            display: none !important;
+            visibility: hidden !important;
+        }}
 
         /* Remove top spacing left by hidden headers */
         .block-container {{
@@ -434,7 +448,6 @@ def inject_css(dark_mode: bool = True) -> None:
     """
 
     # Strip all leading whitespace from every line so Streamlit's Markdown
-    # parser can never mistake indented CSS for a fenced code block (see
-    # the docstring above) — this is the fix for the "raw CSS on screen" bug.
+    # parser can never mistake indented CSS for a fenced code block
     css = "\n".join(line.lstrip() for line in raw_css.splitlines())
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
