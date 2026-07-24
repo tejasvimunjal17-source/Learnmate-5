@@ -4,31 +4,52 @@ backend/resume_generator.py
 Turns a backend.resume_store.ResumeProfile into an ATS-friendly resume
 file (PDF or DOCX), returned as bytes for st.download_button().
 
-ATS-friendliness rules followed here (deliberately, not incidentally):
-- Single column, no tables, no text boxes, no images, no multi-column
-  layout - ATS parsers read left-to-right/top-to-bottom and can silently
-  drop content trapped in tables or floating text boxes.
-- Standard, consistently-ordered section headings (EDUCATION, SKILLS,
-  INTERNSHIP EXPERIENCE, PROJECTS, CERTIFICATIONS, ACHIEVEMENTS, HOBBIES).
-- Plain hyphen bullets, not custom glyphs/icons, since some ATS bullet
-  fonts don't map to Unicode symbols cleanly.
-- Standard fonts (Helvetica / Calibri) at readable sizes, no color-only
-  emphasis (bold/caps only).
+Education section format
+-------------------------
+ResumeProfile.education is a single free-text field (no dedicated
+dataclass), populated by frontend/resume_builder.py's dynamic education
+cards as blocks like:
+
+    Bachelor of Commerce (Honours) | Pursuing
+    Dronacharya Government College
+    Gurugram University
+    2025 – 2029          Gurugram, Haryana, India
+
+_parse_education_blocks() below segments that free text back into
+structured (title, years, institution, location, board, grade) blocks -
+anchored on the line that contains a 4-digit year (the "years + location"
+line) - and both renderers lay each block out as:
+
+    Degree | Status .......................... 2025 - 2029   (right-aligned)
+    Institution ............................... Location       (right-aligned, italic)
+    University / Board                                          (bold + italic)
+
+This parsing is self-contained to this module; ResumeProfile and
+save_resume() are untouched.
+
+ATS notes
+----------
+Right-aligned dates require either a table or a right tab stop - a
+single-row, borderless 2-column table (PDF) and a right tab stop (DOCX,
+no table at all) are used for exactly that purpose. Everything else keeps
+the original single-column, bullet-based, no-table layout.
 """
 
 from __future__ import annotations
 
 import io
+import re
+from dataclasses import dataclass
 
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_LEFT
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Inches, Emu
+from docx.enum.text import WD_TAB_ALIGNMENT
 
 from backend.resume_store import ResumeProfile
 from backend.logger_setup import get_logger
@@ -54,8 +75,131 @@ def _contact_line(profile: ResumeProfile) -> str:
 
 
 # ------------------------------------------------------------------
+# Education parsing (free text -> structured blocks)
+# ------------------------------------------------------------------
+# Anchor line: contains a 4-digit year, optionally followed by 2+ spaces
+# and a location (e.g. "2025 – 2029          Gurugram, Haryana, India",
+# or "2025          Gurugram, Haryana, India" for a single passing year).
+_YEAR_LOCATION_RE = re.compile(r"^(?P<years>.*?\d{4}.*?)(?:\s{2,}(?P<location>\S.*))?$")
+
+
+@dataclass
+class _EducationBlock:
+    title: str = ""
+    years: str = ""
+    institution: str = ""
+    location: str = ""
+    board: str = ""
+    grade: str = ""
+
+
+def _parse_education_blocks(education_text: str) -> list[_EducationBlock]:
+    """Segment ResumeProfile.education free text into structured blocks."""
+    if not education_text or not education_text.strip():
+        return []
+
+    lines = [l for l in education_text.splitlines() if l.strip()]
+    raw_blocks: list[list[str]] = []
+    buffer: list[str] = []
+    i, n = 0, len(lines)
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        buffer.append(line)
+
+        if stripped.lower().startswith("grade:"):
+            raw_blocks.append(buffer)
+            buffer = []
+            i += 1
+            continue
+
+        if len(buffer) >= 2 and _YEAR_LOCATION_RE.match(stripped):
+            if i + 1 < n and lines[i + 1].strip().lower().startswith("grade:"):
+                buffer.append(lines[i + 1])
+                i += 2
+            else:
+                i += 1
+            raw_blocks.append(buffer)
+            buffer = []
+            continue
+
+        i += 1
+
+    if buffer:
+        raw_blocks.append(buffer)  # leftover lines that didn't match the pattern
+
+    blocks: list[_EducationBlock] = []
+    for raw in raw_blocks:
+        block = _EducationBlock()
+        remaining = list(raw)
+
+        if remaining and remaining[-1].strip().lower().startswith("grade:"):
+            block.grade = remaining[-1].split(":", 1)[-1].strip()
+            remaining = remaining[:-1]
+
+        if remaining:
+            m = _YEAR_LOCATION_RE.match(remaining[-1].strip())
+            if m:
+                block.years = (m.group("years") or "").strip()
+                block.location = (m.group("location") or "").strip()
+                remaining = remaining[:-1]
+
+        if remaining:
+            block.title = remaining[0].strip()
+        if len(remaining) >= 2:
+            block.institution = remaining[1].strip()
+        if len(remaining) >= 3:
+            block.board = remaining[2].strip()
+
+        blocks.append(block)
+
+    return blocks
+
+
+# ------------------------------------------------------------------
 # PDF (reportlab)
 # ------------------------------------------------------------------
+def _add_education_pdf(story: list, blocks: list[_EducationBlock], heading_style, content_width: float) -> None:
+    title_style = ParagraphStyle("EduTitle", fontName="Helvetica-Bold", fontSize=10, leading=14, alignment=TA_LEFT)
+    year_style = ParagraphStyle("EduYear", fontName="Helvetica", fontSize=10, leading=14, alignment=TA_RIGHT)
+    inst_style = ParagraphStyle("EduInst", fontName="Helvetica", fontSize=10, leading=14, alignment=TA_LEFT)
+    loc_style = ParagraphStyle("EduLoc", fontName="Helvetica-Oblique", fontSize=10, leading=14, alignment=TA_RIGHT)
+    board_style = ParagraphStyle("EduBoard", fontName="Helvetica-BoldOblique", fontSize=10, leading=14, alignment=TA_LEFT)
+    grade_style = ParagraphStyle("EduGrade", fontName="Helvetica", fontSize=9, leading=12,
+                                  alignment=TA_LEFT, textColor="#444444")
+
+    story.append(Paragraph("EDUCATION", heading_style))
+    left_w = content_width * 0.62
+    right_w = content_width - left_w
+
+    for idx, b in enumerate(blocks):
+        rows = []
+        if b.title or b.years:
+            rows.append([Paragraph(b.title, title_style), Paragraph(b.years, year_style)])
+        if b.institution or b.location:
+            rows.append([Paragraph(b.institution, inst_style), Paragraph(b.location, loc_style)])
+
+        if rows:
+            table = Table(rows, colWidths=[left_w, right_w])
+            table.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]))
+            story.append(table)
+
+        if b.board:
+            story.append(Paragraph(b.board, board_style))
+        if b.grade:
+            story.append(Paragraph(f"Grade: {b.grade}", grade_style))
+
+        if idx < len(blocks) - 1:
+            story.append(Spacer(1, 6))
+
+
 def build_resume_pdf(profile: ResumeProfile) -> bytes:
     """Generate an ATS-friendly, single-column PDF resume.
 
@@ -111,10 +255,14 @@ def build_resume_pdf(profile: ResumeProfile) -> bytes:
             story.append(Paragraph(text.upper(), heading_style))
 
         if profile.education:
-            add_heading("Education")
-            for line in profile.education.splitlines():
-                if line.strip():
-                    story.append(Paragraph(f"- {line.strip()}", bullet_style))
+            education_blocks = _parse_education_blocks(profile.education)
+            if education_blocks:
+                _add_education_pdf(story, education_blocks, heading_style, doc.width)
+            else:
+                add_heading("Education")
+                for line in profile.education.splitlines():
+                    if line.strip():
+                        story.append(Paragraph(f"- {line.strip()}", bullet_style))
 
         if profile.skills:
             add_heading("Skills")
@@ -174,6 +322,47 @@ def build_resume_pdf(profile: ResumeProfile) -> bytes:
 # ------------------------------------------------------------------
 # DOCX (python-docx)
 # ------------------------------------------------------------------
+def _add_education_docx(doc: Document, blocks: list[_EducationBlock], add_heading) -> None:
+    section = doc.sections[0]
+    usable_width_in = Emu(
+        section.page_width.emu - section.left_margin.emu - section.right_margin.emu
+    ).inches
+
+    add_heading("Education")
+
+    for idx, b in enumerate(blocks):
+        if b.title or b.years:
+            p = doc.add_paragraph()
+            p.paragraph_format.tab_stops.add_tab_stop(Inches(usable_width_in), WD_TAB_ALIGNMENT.RIGHT)
+            title_run = p.add_run(b.title)
+            title_run.bold = True
+            if b.years:
+                p.add_run(f"\t{b.years}")
+
+        if b.institution or b.location:
+            p2 = doc.add_paragraph()
+            p2.paragraph_format.tab_stops.add_tab_stop(Inches(usable_width_in), WD_TAB_ALIGNMENT.RIGHT)
+            p2.add_run(b.institution)
+            if b.location:
+                loc_run = p2.add_run(f"\t{b.location}")
+                loc_run.italic = True
+
+        if b.board:
+            p3 = doc.add_paragraph()
+            board_run = p3.add_run(b.board)
+            board_run.bold = True
+            board_run.italic = True
+
+        if b.grade:
+            grade_p = doc.add_paragraph(f"Grade: {b.grade}")
+            if grade_p.runs:
+                grade_p.runs[0].font.size = Pt(9)
+
+        if idx < len(blocks) - 1:
+            spacer = doc.add_paragraph()
+            spacer.paragraph_format.space_after = Pt(2)
+
+
 def build_resume_docx(profile: ResumeProfile) -> bytes:
     """Generate an ATS-friendly, single-column DOCX resume.
 
@@ -222,10 +411,14 @@ def build_resume_docx(profile: ResumeProfile) -> bytes:
             doc.add_paragraph(f"- {text}")
 
         if profile.education:
-            add_heading("Education")
-            for line in profile.education.splitlines():
-                if line.strip():
-                    add_bullet(line.strip())
+            education_blocks = _parse_education_blocks(profile.education)
+            if education_blocks:
+                _add_education_docx(doc, education_blocks, add_heading)
+            else:
+                add_heading("Education")
+                for line in profile.education.splitlines():
+                    if line.strip():
+                        add_bullet(line.strip())
 
         if profile.skills:
             add_heading("Skills")
