@@ -202,6 +202,132 @@ def _duration_bucket(duration: str) -> str:
     return "20+ hours / multi-week"
 
 
+# ------------------------------------------------------------------
+# Fuzzy matching (RapidFuzz, with a stdlib fallback so a missing
+# dependency degrades gracefully instead of breaking the page - add
+# `rapidfuzz>=3.9` to requirements.txt for real fuzzy matching; without
+# it this still works, just with weaker (difflib-based) similarity).
+# ------------------------------------------------------------------
+try:
+    from rapidfuzz import fuzz as _fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only when the dep is missing
+    import difflib
+    _RAPIDFUZZ_AVAILABLE = False
+
+
+def _similarity(a: str, b: str) -> float:
+    """Fuzzy similarity score, 0-100. RapidFuzz if available, difflib otherwise."""
+    if not a or not b:
+        return 0.0
+    if _RAPIDFUZZ_AVAILABLE:
+        return _fuzz.WRatio(a, b)
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+
+# ------------------------------------------------------------------
+# Synonym expansion - so "ML" also finds "Machine Learning" courses,
+# "GenAI"/"Prompt Engineering" find AI courses, etc.
+# ------------------------------------------------------------------
+SYNONYM_GROUPS: list[set[str]] = [
+    {"ai", "artificial intelligence", "genai", "generative ai", "prompt engineering", "prompt design"},
+    {"ml", "machine learning", "deep learning"},
+    {"data science", "data analytics", "data analysis"},
+    {"web dev", "web development", "frontend", "front-end", "backend", "back-end", "full stack", "fullstack"},
+    {"cybersecurity", "cyber security", "infosec", "information security"},
+    {"cloud", "cloud computing"},
+    {"ui/ux", "ux", "ui", "user experience", "user interface", "design"},
+    {"devops", "dev ops", "site reliability", "sre", "ci/cd"},
+    {"python", "py"},
+]
+
+
+def _expand_query(query: str) -> list[str]:
+    """Return [query] plus any synonym terms that match it or its words."""
+    if not query:
+        return []
+    q = query.strip().lower()
+    variants = {q}
+    for group in SYNONYM_GROUPS:
+        if q in group or any(word in group for word in q.split()):
+            variants |= group
+    return list(variants)
+
+
+_FUZZY_THRESHOLD = 60.0
+
+
+def _course_score(course: FreeCourse, query_variants: list[str]) -> float:
+    """Best fuzzy-match score across the course's searchable text and all query variants."""
+    if not query_variants:
+        return 100.0
+    searchable = f"{course.name} {course.provider} {course.domain} {course.platform}"
+    return max(
+        (_similarity(variant, searchable) for variant in query_variants),
+        default=0.0,
+    )
+
+
+# ------------------------------------------------------------------
+# Search across multiple providers - the curated catalogue already spans
+# 9+ official platforms (Google Skillshop, Microsoft Learn, IBM
+# SkillsBuild, Cisco Networking Academy, Coursera, edX, freeCodeCamp,
+# Kaggle Learn, AWS Skill Builder). "Multi-provider" search here means
+# fuzzy-matching across every course regardless of platform, rather than
+# requiring an exact platform/name match.
+# ------------------------------------------------------------------
+def _apply_hard_filters(
+    courses: list[FreeCourse], domain: str | None, platform: str | None,
+    difficulty: str | None, duration: str | None, certificate_only: bool,
+) -> list[FreeCourse]:
+    results = list(courses)
+    if domain and domain != "All Domains":
+        results = [c for c in results if c.domain == domain]
+    if platform and platform != "All Platforms":
+        results = [c for c in results if c.platform == platform]
+    if difficulty and difficulty != "All Levels":
+        results = [c for c in results if c.difficulty == difficulty]
+    if duration and duration != "Any":
+        results = [c for c in results if _duration_bucket(c.duration) == duration]
+    if certificate_only:
+        results = [c for c in results if c.certificate]
+    return results
+
+
+def _fuzzy_rank(courses: list[FreeCourse], query: str) -> list[FreeCourse]:
+    """Fuzzy+synonym-rank courses against `query`; unfiltered if query is empty."""
+    variants = _expand_query(query)
+    if not variants:
+        return courses
+    scored = [(c, _course_score(c, variants)) for c in courses]
+    scored = [(c, s) for c, s in scored if s >= _FUZZY_THRESHOLD]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [c for c, _ in scored]
+
+
+try:
+    import streamlit as _st
+    _cache_data = _st.cache_data
+except ImportError:  # pragma: no cover - only if streamlit isn't installed at all
+    def _cache_data(*_a, **_k):
+        def _decorator(fn):
+            return fn
+        return _decorator
+
+
+def _dedupe(courses: list[FreeCourse]) -> list[FreeCourse]:
+    """Merge duplicate results (same course name + provider)."""
+    seen: set[tuple[str, str]] = set()
+    unique: list[FreeCourse] = []
+    for c in courses:
+        key = (c.name.strip().lower(), c.provider.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+@_cache_data(ttl=600, show_spinner=False)
 def search_free_courses(
     domain: str | None = None,
     query: str = "",
@@ -209,30 +335,55 @@ def search_free_courses(
     difficulty: str | None = None,
     duration: str | None = None,
     certificate_only: bool = False,
+    page: int = 1,
+    page_size: int = 50,
 ) -> list[FreeCourse]:
-    """Filter the curated catalogue by domain + free-text + facets."""
-    results = list(_CATALOGUE)
+    """Search the curated catalogue with fuzzy/synonym matching and pagination.
 
-    if domain and domain != "All Domains":
-        results = [c for c in results if c.domain == domain]
+    Filters are applied normally first. If that combination returns zero
+    results, filters are progressively relaxed (platform/difficulty/
+    duration/certificate, then domain, then the fuzzy threshold itself)
+    so the caller still gets similar/nearby results instead of an empty
+    list - the same query never returns nothing as long as the catalogue
+    has anything remotely related.
 
-    if query:
-        q = query.strip().lower()
-        results = [
-            c for c in results
-            if q in c.name.lower() or q in c.provider.lower()
-        ]
+    `page`/`page_size` are optional and default to returning the first up
+    to 50 (page_size capped at 50) results, so existing callers that don't
+    pass them behave exactly as before.
+    """
+    page_size = max(1, min(page_size, 50))
+    page = max(1, page)
 
-    if platform and platform != "All Platforms":
-        results = [c for c in results if c.platform == platform]
+    catalogue = _dedupe(_CATALOGUE)
+    filtered = _apply_hard_filters(catalogue, domain, platform, difficulty, duration, certificate_only)
+    ranked = _fuzzy_rank(filtered, query)
 
-    if difficulty and difficulty != "All Levels":
-        results = [c for c in results if c.difficulty == difficulty]
+    relaxed = False
+    if not ranked and (query or domain not in (None, "All Domains") or platform not in (None, "All Platforms")
+                        or difficulty not in (None, "All Levels") or duration not in (None, "Any") or certificate_only):
+        # Step 1: keep domain + query, drop platform/difficulty/duration/certificate.
+        relaxed_pool = _apply_hard_filters(catalogue, domain, None, None, None, False)
+        ranked = _fuzzy_rank(relaxed_pool, query)
+        relaxed = True
 
-    if duration and duration != "Any":
-        results = [c for c in results if _duration_bucket(c.duration) == duration]
+    if not ranked and query:
+        # Step 2: drop domain too, fuzzy-match the whole catalogue.
+        ranked = _fuzzy_rank(catalogue, query)
+        relaxed = True
 
-    if certificate_only:
-        results = [c for c in results if c.certificate]
+    if not ranked and query:
+        # Step 3: still nothing above threshold - surface the closest
+        # matches anyway ("similar opportunities") rather than nothing.
+        variants = _expand_query(query)
+        scored = sorted(
+            ((c, _course_score(c, variants)) for c in catalogue),
+            key=lambda pair: pair[1], reverse=True,
+        )
+        ranked = [c for c, _ in scored[:page_size]]
+        relaxed = True
 
-    return results
+    if not ranked:
+        ranked = catalogue
+
+    start = (page - 1) * page_size
+    return ranked[start: start + page_size]
